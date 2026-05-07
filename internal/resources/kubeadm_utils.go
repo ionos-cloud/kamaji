@@ -203,6 +203,15 @@ func KubeadmPhaseCreate(ctx context.Context, r KubeadmPhaseResource, logger logr
 		TenantControlPlaneCGroupDriver: tenantControlPlane.Spec.Kubernetes.Kubelet.CGroupFS.String(), //nolint:staticcheck
 	}
 
+	// Hash kubelet JSON patches into the phase checksum so changes to
+	// spec.kubernetes.kubelet.configurationJSONPatches actually invalidate
+	// the cached upload-config-kubelet phase and trigger a re-upload.
+	if len(tenantControlPlane.Spec.Kubernetes.Kubelet.ConfigurationJSONPatches) > 0 {
+		if jsonP, jpErr := tenantControlPlane.Spec.Kubernetes.Kubelet.ConfigurationJSONPatches.ToJSON(); jpErr == nil {
+			config.KubeletPatches = jsonP
+		}
+	}
+
 	var checksum string
 
 	status, err := r.GetStatus(tenantControlPlane)
