@@ -14,6 +14,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	clientset "k8s.io/client-go/kubernetes"
 	bootstrapapi "k8s.io/cluster-bootstrap/token/api"
+	bootstraptokennode "k8s.io/kubernetes/cmd/kubeadm/app/phases/bootstraptoken/node"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 
@@ -103,6 +104,25 @@ func KubeadmBootstrap(ctx context.Context, r KubeadmPhaseResource, logger logr.L
 		}
 	}
 
+	client, err := utilities.GetTenantClientSet(ctx, r.GetClient(), tenantControlPlane)
+	if err != nil {
+		logger.Error(err, "cannot generate tenant client")
+
+		return controllerutil.OperationResultNone, err
+	}
+
+	// Ensure the apiserver->kubelet RBAC binding exists on every reconcile,
+	// independent of the cluster-info checksum gate below. kubeadm 1.36 dropped
+	// the privileged org from the apiserver-kubelet-client cert and authorizes it
+	// via this binding instead; without it apiserver->kubelet is Forbidden. The
+	// gate would otherwise skip it on already-provisioned clusters (and on cert
+	// renewal). Idempotent CreateOrUpdate. See PSC-5389.
+	if err = bootstraptokennode.AllowAPIServerToAccessKubeletAPI(client); err != nil {
+		logger.Error(err, "cannot ensure apiserver->kubelet RBAC binding")
+
+		return controllerutil.OperationResultNone, err
+	}
+
 	status, err := r.GetStatus(tenantControlPlane)
 	if err != nil {
 		logger.Error(err, "cannot retrieve status")
@@ -139,13 +159,6 @@ func KubeadmBootstrap(ctx context.Context, r KubeadmPhaseResource, logger logr.L
 	fun, err := r.GetKubeadmFunction(ctx, tenantControlPlane)
 	if err != nil {
 		logger.Error(err, "cannot retrieve kubeadm function")
-
-		return controllerutil.OperationResultNone, err
-	}
-
-	client, err := utilities.GetTenantClientSet(ctx, r.GetClient(), tenantControlPlane)
-	if err != nil {
-		logger.Error(err, "cannot generate tenant client")
 
 		return controllerutil.OperationResultNone, err
 	}
