@@ -15,6 +15,10 @@ type Configuration struct {
 	InitConfiguration kubeadmapi.InitConfiguration
 	Kubeconfig        clientcmdapiv1.Config
 	Parameters        Parameters
+	// KubeletPatches is the raw JSON of the TCP's kubelet configurationJSONPatches.
+	// Included in Checksum so that changes to the patches invalidate the cached
+	// kubeadm-phase status and trigger a re-upload of kubelet-config.
+	KubeletPatches []byte
 }
 
 func (c *Configuration) Checksum() string {
@@ -26,6 +30,7 @@ func (c *Configuration) Checksum() string {
 		"InitConfiguration": initConfiguration,
 		"Kubeconfig":        kubeconfig,
 		"Parameters":        parameters,
+		"KubeletPatches":    c.KubeletPatches,
 	}
 
 	return utilities.CalculateMapChecksum(data)
