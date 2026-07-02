@@ -9,7 +9,6 @@ import (
 
 	"github.com/go-logr/logr"
 	corev1 "k8s.io/api/core/v1"
-	rbacv1 "k8s.io/api/rbac/v1"
 	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
@@ -104,20 +103,6 @@ func KubeadmBootstrap(ctx context.Context, r KubeadmPhaseResource, logger logr.L
 		}
 	}
 
-	// Ensure the apiserver->kubelet RBAC binding exists, independent of the
-	// cluster-info checksum gate below, so already-provisioned clusters self-heal
-	// (the gate would otherwise skip the bootstrap-token phase for them).
-	// The kubeadm 1.36 emitter mints the apiserver-kubelet-client cert without the
-	// privileged org and authorizes it via this binding instead; without it,
-	// apiserver->kubelet calls (logs/exec, nodes/proxy) are Forbidden.
-	// Create-if-absent only: the binding content is constant and its RoleRef is
-	// immutable, so an Update on drift would wedge the cluster in a 422 loop.
-	if err = ensureAPIServerKubeletRBAC(ctx, tntClient); err != nil {
-		logger.Error(err, "cannot ensure apiserver->kubelet RBAC binding")
-
-		return controllerutil.OperationResultNone, err
-	}
-
 	status, err := r.GetStatus(tenantControlPlane)
 	if err != nil {
 		logger.Error(err, "cannot retrieve status")
@@ -182,36 +167,6 @@ func KubeadmBootstrap(ctx context.Context, r KubeadmPhaseResource, logger logr.L
 	}
 
 	return controllerutil.OperationResultUpdated, nil
-}
-
-// ensureAPIServerKubeletRBAC creates the kubeadm:apiserver-kubelet-client
-// ClusterRoleBinding on the tenant if it is absent, granting the apiserver's
-// kubelet client access to the kubelet API. It is a no-op when the binding
-// already exists: the binding is constant and its RoleRef is immutable, so it
-// never issues an update (which would 422 on any drift).
-func ensureAPIServerKubeletRBAC(ctx context.Context, tenantClient client.Client) error {
-	const bindingName = "kubeadm:apiserver-kubelet-client"
-
-	var binding rbacv1.ClusterRoleBinding
-	switch err := tenantClient.Get(ctx, types.NamespacedName{Name: bindingName}, &binding); {
-	case err == nil:
-		return nil
-	case !k8serrors.IsNotFound(err):
-		return err
-	}
-
-	return client.IgnoreAlreadyExists(tenantClient.Create(ctx, &rbacv1.ClusterRoleBinding{
-		ObjectMeta: metav1.ObjectMeta{Name: bindingName},
-		RoleRef: rbacv1.RoleRef{
-			APIGroup: rbacv1.GroupName,
-			Kind:     "ClusterRole",
-			Name:     "system:kubelet-api-admin",
-		},
-		Subjects: []rbacv1.Subject{{
-			Kind: rbacv1.UserKind,
-			Name: "kube-apiserver-kubelet-client",
-		}},
-	}))
 }
 
 func KubeadmPhaseCreate(ctx context.Context, r KubeadmPhaseResource, logger logr.Logger, tenantControlPlane *kamajiv1alpha1.TenantControlPlane) (controllerutil.OperationResult, error) {
