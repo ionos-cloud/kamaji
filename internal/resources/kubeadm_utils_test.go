@@ -16,6 +16,8 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
+
+	"github.com/clastix/kamaji/internal/constants"
 )
 
 const apiServerKubeletBindingName = "kubeadm:apiserver-kubelet-client"
@@ -35,7 +37,7 @@ func TestEnsureAPIServerKubeletRBAC(t *testing.T) {
 	t.Run("creates the binding when absent", func(t *testing.T) {
 		c := fake.NewClientBuilder().WithScheme(scheme.Scheme).Build()
 
-		if err := ensureAPIServerKubeletRBAC(context.Background(), c); err != nil {
+		if err := ensureAPIServerKubeletRBAC(context.Background(), c, "test-tcp"); err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
 
@@ -48,12 +50,19 @@ func TestEnsureAPIServerKubeletRBAC(t *testing.T) {
 			binding.Subjects[0].Name != "kube-apiserver-kubelet-client" {
 			t.Fatalf("unexpected Subjects: %#v", binding.Subjects)
 		}
+		// The binding must carry the standard Kamaji project label so it is
+		// consistent with sibling tenant RBAC and visible to label-based cleanup.
+		if binding.Labels[constants.ProjectNameLabelKey] != constants.ProjectNameLabelValue {
+			t.Fatalf("missing Kamaji project label: %#v", binding.Labels)
+		}
 	})
 
-	t.Run("is a no-op when the binding already exists", func(t *testing.T) {
+	t.Run("does not reconcile an existing binding", func(t *testing.T) {
 		// Seed a binding whose RoleRef differs from what we would create. Because
-		// RoleRef is immutable, any Update attempt would fail; the helper must not
-		// issue one. The existing object must be left untouched.
+		// RoleRef is immutable, any Update attempt would fail; the helper is
+		// create-if-absent and must leave the existing object untouched (this is
+		// the deliberate divergence from upstream CreateOrUpdate — see the helper
+		// doc: a corrupted binding is not self-repaired).
 		existing := &rbacv1.ClusterRoleBinding{
 			ObjectMeta: metav1.ObjectMeta{Name: apiServerKubeletBindingName},
 			RoleRef: rbacv1.RoleRef{
@@ -71,7 +80,7 @@ func TestEnsureAPIServerKubeletRBAC(t *testing.T) {
 				},
 			}).Build()
 
-		if err := ensureAPIServerKubeletRBAC(context.Background(), c); err != nil {
+		if err := ensureAPIServerKubeletRBAC(context.Background(), c, "test-tcp"); err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
 
@@ -94,7 +103,7 @@ func TestEnsureAPIServerKubeletRBAC(t *testing.T) {
 				},
 			}).Build()
 
-		if err := ensureAPIServerKubeletRBAC(context.Background(), c); err != nil {
+		if err := ensureAPIServerKubeletRBAC(context.Background(), c, "test-tcp"); err != nil {
 			t.Fatalf("AlreadyExists on create must be tolerated, got: %v", err)
 		}
 	})
@@ -108,7 +117,7 @@ func TestEnsureAPIServerKubeletRBAC(t *testing.T) {
 				},
 			}).Build()
 
-		if err := ensureAPIServerKubeletRBAC(context.Background(), c); !errors.Is(err, boom) {
+		if err := ensureAPIServerKubeletRBAC(context.Background(), c, "test-tcp"); !errors.Is(err, boom) {
 			t.Fatalf("expected get error to propagate, got: %v", err)
 		}
 	})
