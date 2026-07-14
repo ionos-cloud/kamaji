@@ -9,11 +9,13 @@ import (
 
 	"github.com/go-logr/logr"
 	corev1 "k8s.io/api/core/v1"
+	rbacv1 "k8s.io/api/rbac/v1"
 	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	clientset "k8s.io/client-go/kubernetes"
 	bootstrapapi "k8s.io/cluster-bootstrap/token/api"
+	kubeadmconstants "k8s.io/kubernetes/cmd/kubeadm/app/constants"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 
@@ -103,6 +105,22 @@ func KubeadmBootstrap(ctx context.Context, r KubeadmPhaseResource, logger logr.L
 		}
 	}
 
+	// Ensure the apiserver->kubelet RBAC binding exists, independent of the
+	// cluster-info checksum gate below, so already-provisioned clusters self-heal
+	// (the gate would otherwise skip the bootstrap-token phase for them).
+	// The kubeadm 1.36 emitter mints the apiserver-kubelet-client cert without the
+	// privileged org and authorizes it via this binding instead; without it,
+	// apiserver->kubelet calls (logs/exec, nodes/proxy) are Forbidden.
+	// Create-if-absent only: the binding content is constant and its RoleRef is
+	// immutable, so an Update on drift would wedge the cluster in a 422 loop.
+	// Best-effort: like the cluster-info Get above, a transient tenant-API error
+	// here must not fail the whole reconcile (that would needlessly churn already
+	// converged clusters). The binding is reconciled before the checksum gate on
+	// every reconcile, so a failure simply self-heals on the next pass.
+	if err = ensureAPIServerKubeletRBAC(ctx, tntClient, tenantControlPlane.GetName()); err != nil {
+		logger.Error(err, "cannot ensure apiserver->kubelet RBAC binding; will retry on next reconcile")
+	}
+
 	status, err := r.GetStatus(tenantControlPlane)
 	if err != nil {
 		logger.Error(err, "cannot retrieve status")
@@ -167,6 +185,49 @@ func KubeadmBootstrap(ctx context.Context, r KubeadmPhaseResource, logger logr.L
 	}
 
 	return controllerutil.OperationResultUpdated, nil
+}
+
+// ensureAPIServerKubeletRBAC creates the kubeadm:apiserver-kubelet-client
+// ClusterRoleBinding on the tenant if it is absent, granting the apiserver's
+// kubelet client access to the kubelet API.
+//
+// It is create-if-absent only: on any successful Get it returns without
+// reconciling, because the RoleRef is immutable and an Update on drift would
+// wedge the tenant in a 422 loop. This intentionally diverges from upstream
+// AllowAPIServerToAccessKubeletAPI (which uses CreateOrUpdate): the failure
+// modes we target are the binding's absence and org-less cert renewal, and the
+// binding is keyed on the stable cert CN, so both are covered here. The
+// tradeoff is that a corrupted Subjects list on an already-existing binding is
+// NOT repaired — that must be handled manually.
+//
+// The names mirror the ones kubeadm itself uses (via the vendored constants) so
+// a future kubeadm rename cannot silently drift this copy, and the object is
+// stamped with the standard Kamaji labels so it is consistent with sibling
+// tenant RBAC and visible to label-based cleanup.
+func ensureAPIServerKubeletRBAC(ctx context.Context, tenantClient client.Client, tcpName string) error {
+	var binding rbacv1.ClusterRoleBinding
+	switch err := tenantClient.Get(ctx, types.NamespacedName{Name: kubeadmconstants.KubeletAPIAdminClusterRoleBindingName}, &binding); {
+	case err == nil:
+		return nil
+	case !k8serrors.IsNotFound(err):
+		return err
+	}
+
+	return client.IgnoreAlreadyExists(tenantClient.Create(ctx, &rbacv1.ClusterRoleBinding{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:   kubeadmconstants.KubeletAPIAdminClusterRoleBindingName,
+			Labels: utilities.KamajiLabels(tcpName, "apiserver-kubelet-client-rbac"),
+		},
+		RoleRef: rbacv1.RoleRef{
+			APIGroup: rbacv1.GroupName,
+			Kind:     "ClusterRole",
+			Name:     kubeadmconstants.KubeletAPIAdminClusterRoleName,
+		},
+		Subjects: []rbacv1.Subject{{
+			Kind: rbacv1.UserKind,
+			Name: kubeadmconstants.APIServerKubeletClientCertCommonName,
+		}},
+	}))
 }
 
 func KubeadmPhaseCreate(ctx context.Context, r KubeadmPhaseResource, logger logr.Logger, tenantControlPlane *kamajiv1alpha1.TenantControlPlane) (controllerutil.OperationResult, error) {

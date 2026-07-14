@@ -25,6 +25,7 @@ import (
 	"k8s.io/client-go/tools/clientcmd"
 	kubeadmv1beta4 "k8s.io/kubernetes/cmd/kubeadm/app/apis/kubeadm/v1beta4"
 	"k8s.io/kubernetes/cmd/kubeadm/app/cmd"
+	kubeadmconstants "k8s.io/kubernetes/cmd/kubeadm/app/constants"
 	pointer "k8s.io/utils/ptr"
 
 	kamajiv1alpha1 "github.com/clastix/kamaji/api/v1alpha1"
@@ -117,6 +118,35 @@ var _ = Describe("starting a kind worker with kubeadm", func() {
 
 			_, err := kubeconfigFile.Write(secret.Data["admin.conf"])
 			Expect(err).ToNot(HaveOccurred())
+		})
+
+		By("verifying the apiserver->kubelet RBAC binding exists", func() {
+			config, err := clientcmd.BuildConfigFromFlags("", kubeconfigFile.Name())
+			Expect(err).ToNot(HaveOccurred())
+
+			clientset, err := kubernetes.NewForConfig(config)
+			Expect(err).ToNot(HaveOccurred())
+
+			// kubeadm 1.36 mints the apiserver-kubelet-client cert without the
+			// privileged org and authorizes it via this binding instead. Kamaji's
+			// BootstrapToken phase must create it, or apiserver->kubelet calls
+			// (kubectl logs/exec, nodes/proxy, kubelet metrics) are Forbidden.
+			Eventually(func() error {
+				crb, err := clientset.RbacV1().ClusterRoleBindings().Get(ctx, kubeadmconstants.KubeletAPIAdminClusterRoleBindingName, metav1.GetOptions{})
+				if err != nil {
+					return err
+				}
+
+				if crb.RoleRef.Name != kubeadmconstants.KubeletAPIAdminClusterRoleName {
+					return fmt.Errorf("unexpected RoleRef: got %q, want %q", crb.RoleRef.Name, kubeadmconstants.KubeletAPIAdminClusterRoleName)
+				}
+
+				if len(crb.Subjects) != 1 || crb.Subjects[0].Name != kubeadmconstants.APIServerKubeletClientCertCommonName {
+					return fmt.Errorf("unexpected subjects: %v", crb.Subjects)
+				}
+
+				return nil
+			}, time.Minute, time.Second).Should(Succeed())
 		})
 
 		var joinCommandBuffer *bytes.Buffer
